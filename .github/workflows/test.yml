@@ -1,72 +1,66 @@
-# Runs every submission (and example) a pull request adds or changes through test/run.sh on a clean Ubuntu 24.04,
-# against Postgres 18 in a service container.
-name: test submissions
+name: C# isolated AOT and UTF-8 comparison
+
 on:
   pull_request:
-  push:
-    branches: [main]
-  workflow_dispatch:   # re-tests every submission and example
+    branches: [csharp-kestrel-wylieagab]
+
 permissions:
   contents: read
 
 jobs:
-  find:
+  compare:
     runs-on: ubuntu-24.04
-    outputs:
-      dirs: ${{ steps.dirs.outputs.dirs }}
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - id: dirs
-        run: |
-          all() { ls -d submissions/*/ examples/*/ 2>/dev/null | sed 's#/$#/x#'; }
-          if [ "${{ github.event_name }}" = pull_request ]; then
-            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
-          elif [ "${{ github.event_name }}" = push ] && git rev-parse -q --verify HEAD~1 >/dev/null; then
-            changed=$(git diff --name-only HEAD~1 HEAD)
-          else
-            changed=$(all)
-          fi
-          # a change outside submissions/ and examples/ (spec, tests, seed) re-tests everything
-          if echo "$changed" | grep -qvE '^(submissions|examples)/'; then changed=$(all); fi
-          dirs=$(echo "$changed" | awk -F/ '($1=="submissions" || $1=="examples") && NF>2 {print $1"/"$2}' | sort -u | while read -r d; do [ -d "$d" ] && echo "$d"; done)
-          echo "dirs=$(echo "$dirs" | jq -R . | jq -sc 'map(select(length>0))')" >> "$GITHUB_OUTPUT"
-          echo "testing: $dirs"
-
-  test:
-    needs: find
-    if: needs.find.outputs.dirs != '[]'
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        dir: ${{ fromJson(needs.find.outputs.dirs) }}
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:18
-        env: { POSTGRES_PASSWORD: postgres }
+        env:
+          POSTGRES_PASSWORD: postgres
         ports: ['5432:5432']
         options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 20
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       PGHOST: 127.0.0.1
-      PGPORT: 5432
+      PGPORT: '5432'
       PGUSER: postgres
       PGPASSWORD: postgres
+      PGCLIENTENCODING: UTF8
+      JWT_SECRET: million-users-challenge
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      PERF_RESULTS: ${{ runner.temp }}/csharp-perf-results
     steps:
       - uses: actions/checkout@v4
-      - name: tools
+      - name: Install harness prerequisites
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq curl openssl
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client jq curl openssl
           node --version
-      - name: postgres max_connections = 600 (as on the database box)
+          python3 --version
+      - name: Match the upstream CI connection limit
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: |
-          psql -qX -d postgres -c "ALTER SYSTEM SET max_connections = 600"
-          docker restart "$(docker ps -q --filter ancestor=postgres:18)"
-          until pg_isready -q; do sleep 1; done
-      - name: seed
+          psql -qX -v ON_ERROR_STOP=1 -d postgres -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$POSTGRES_CONTAINER"
+          for attempt in $(seq 1 60); do
+            if pg_isready -q; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Build the unchanged deterministic seed
         run: bash seed/make-seed.sh
-      - name: install.sh
-        run: sudo bash ${{ matrix.dir }}/install.sh
-      - name: build, start, test
-        run: bash test/run.sh ${{ matrix.dir }}
+      - name: Install the submission's checksum-pinned SDK
+        run: sudo bash submissions/csharp-kestrel-wylieagab/install.sh
+      - name: Validate and compare four isolated variants
+        timeout-minutes: 20
+        run: python3 _perf/run-comparison.py
+      - name: Preserve logs, manifests, and raw measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csharp-four-variant-comparison-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/csharp-perf-results
+          if-no-files-found: warn
+          retention-days: 14
