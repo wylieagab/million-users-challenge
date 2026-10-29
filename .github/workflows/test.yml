@@ -29,7 +29,6 @@ jobs:
       JWT_SECRET: million-users-challenge
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       DOTNET_NOLOGO: '1'
-      PERF_RESULTS: ${{ runner.temp }}/csharp-perf-results
     steps:
       - uses: actions/checkout@v4
       - name: Install harness prerequisites
@@ -55,6 +54,8 @@ jobs:
         run: sudo bash submissions/csharp-kestrel-wylieagab/install.sh
       - name: Validate and compare four isolated variants
         timeout-minutes: 20
+        env:
+          PERF_RESULTS: ${{ runner.temp }}/csharp-perf-results
         run: python3 _perf/run-comparison.py
       - name: Preserve logs, manifests, and raw measurements
         if: always()
