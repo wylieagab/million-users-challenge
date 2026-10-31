@@ -23,6 +23,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -32,6 +33,8 @@ AOT = '3cff0a51d19018639af2614be2308762a738133e'
 JIT = 'a4af720c410b29b030fbec16fb37617c14d34d21'
 TRIAL_DB = 'reactor_trial'
 CPUTICKS = os.sysconf('SC_CLK_TCK') if sys.platform == 'linux' else 100
+SETTLING_GRACE_S = 15  # Initial mload sleep: between(0, 5) * think-scale 2.5.
+MLOAD_WINDOW_S = 5
 
 
 def write_json(path, value):
@@ -128,14 +131,19 @@ def cpu_utilization(samples, role, cores):
 
 
 def trial_summary(raw, samples, *, ramp, app_cores, db_cores, generator_cores, app_alive):
-    hold = [s for s in samples if s['t'] >= ramp]
-    steady = [t for t in raw.get('timeline', []) if t['t'] >= ramp + 5]
+    settled_start = ramp + SETTLING_GRACE_S
+    hold = [s for s in samples if s['t'] >= settled_start]
+    connections = [t for t in raw.get('timeline', []) if t['t'] >= settled_start]
+    # A latency tick summarizes the preceding five seconds. Its entire window
+    # must follow settling; connection counts are instantaneous at each tick.
+    latency_windows = [t for t in raw.get('timeline', [])
+                       if t['t'] >= settled_start + MLOAD_WINDOW_S]
     successful = raw.get('reqs', 0) - raw.get('fails', 0)
     cpu = cpu_seconds(samples, 'app')
     gen_util = cpu_utilization(hold, 'generator', generator_cores)
     db_util = cpu_utilization(hold, 'database', db_cores)
-    min_conns = min((t['conns'] for t in steady), default=0)
-    full_connections = bool(steady) and min_conns >= raw.get('users', 1) * .98
+    min_conns = min((t['conns'] for t in connections), default=0)
+    full_connections = bool(connections) and min_conns >= raw.get('users', 1) * .98
     limited = (gen_util is not None and gen_util >= 85) or (db_util is not None and db_util >= 85)
     # mload's pass flag alone does not prove the requested connections were reached.
     valid = app_alive and full_connections and not limited and bool(raw.get('reqs'))
@@ -145,7 +153,11 @@ def trial_summary(raw, samples, *, ramp, app_cores, db_cores, generator_cores, a
         'error_pct': raw.get('err_pct'), 'p50_ms_including_ramp': raw.get('p50_ms'),
         'p95_ms_including_ramp': raw.get('p95_ms'), 'p99_ms_including_ramp': raw.get('p99_ms'),
         'connect_p99_ms': raw.get('connect_p99_ms'),
-        'max_hold_window_p99_ms': max((t['p99_ms'] for t in steady), default=None),
+        'settling_grace_after_ramp_s': SETTLING_GRACE_S,
+        'hold_cpu_window_starts_at_s': settled_start,
+        'connection_window_starts_at_s': settled_start,
+        'latency_window_ends_at_or_after_s': settled_start + MLOAD_WINDOW_S,
+        'max_hold_window_p99_ms': max((t['p99_ms'] for t in latency_windows), default=None),
         'min_hold_connections': min_conns, 'full_connection_target_reached': full_connections,
         'app_cpu_s': cpu,
         'app_cpu_us_per_successful_request': cpu * 1e6 / successful if cpu is not None and successful else None,
@@ -161,17 +173,70 @@ def trial_summary(raw, samples, *, ramp, app_cores, db_cores, generator_cores, a
     }
 
 
-def schedule(names, levels, rounds, seed):
+def schedule(names, levels, rounds, seed, replicate_index=0):
     shuffled = list(names)
     random.Random(seed).shuffle(shuffled)
     result = []
     for level_index, users in enumerate(levels):
         for round_index in range(rounds):
-            offset = (round_index + level_index) % len(shuffled)
+            offset = (round_index + level_index + replicate_index) % len(shuffled)
             order = shuffled[offset:] + shuffled[:offset]
             for name in order:
-                result.append({'variant': name, 'users': users, 'round': round_index + 1})
+                result.append({'variant': name, 'users': users, 'round': round_index + 1,
+                               'replicate_index': replicate_index, 'order_rotation_offset': offset})
     return result
+
+
+def paired_ratios(results):
+    """Pair only identical host blocks, user counts, and rounds; retain exclusions."""
+    groups = {}
+    for row in results:
+        # A generated block ID identifies this comparison process. It prevents
+        # accidental cross-host pairing even if replica numbers are reused.
+        key = (row['host_block_id'], row['replicate_index'], row['users'], row['round'],
+               bool(row.get('confirmation')))
+        group = groups.setdefault(key, {})
+        if row['variant'] in group:
+            raise ValueError(f'Duplicate trial for {key}: {row["variant"]}')
+        group[row['variant']] = row
+    order = ['minimal-api', 'kestrel-aot', 'kestrel-jit', 'reactor-epoll', 'reactor-uring']
+    metrics = {'cpu_us_per_successful_request': 'app_cpu_us_per_successful_request',
+               'p99_ms': 'p99_ms_including_ramp', 'peak_rss_bytes': 'app_peak_rss_bytes'}
+    status_fields = ('valid_diagnostic_pass', 'diagnostic_trial_valid', 'mload_thresholds_passed',
+                     'full_connection_target_reached', 'generator_or_database_cpu_limited',
+                     'app_alive_after_load')
+    pairs = []
+    for key, group in sorted(groups.items()):
+        present = [name for name in order if name in group]
+        for index, baseline in enumerate(present):
+            for candidate in present[index + 1:]:
+                left, right = group[baseline], group[candidate]
+                eligible = bool(left.get('valid_diagnostic_pass')) and bool(right.get('valid_diagnostic_pass'))
+                observations = {
+                    'baseline': {label: left.get(field) for label, field in metrics.items()},
+                    'candidate': {label: right.get(field) for label, field in metrics.items()},
+                }
+                ratios = None
+                if eligible:
+                    ratios = {}
+                    for label in metrics:
+                        b = observations['baseline'][label]
+                        c = observations['candidate'][label]
+                        ratios[label] = c / b if b is not None and c is not None and b > 0 and c > 0 else None
+                pairs.append({
+                    'host_block_id': key[0], 'replicate_index': key[1], 'users': key[2],
+                    'round': key[3], 'confirmation': key[4],
+                    'baseline': baseline, 'candidate': candidate,
+                    'baseline_trial_id': left['id'], 'candidate_trial_id': right['id'],
+                    'baseline_status': {field: left.get(field) for field in status_fields},
+                    'candidate_status': {field: right.get(field) for field in status_fields},
+                    'eligible_for_comparison': eligible,
+                    'exclusion_reasons': [role + ' did not pass diagnostic validity and thresholds'
+                        for role, row in (('baseline', left), ('candidate', right)) if not row.get('valid_diagnostic_pass')],
+                    'observations': observations,
+                    'candidate_over_baseline_ratios': ratios,
+                })
+    return pairs
 
 
 def extract(ref, source, destination):
@@ -200,6 +265,7 @@ def source_hashes(folder):
 class Comparison:
     def __init__(self, args):
         self.args = args
+        self.host_block_id = uuid.uuid4().hex
         self.out = args.output.resolve()
         self.out.mkdir(parents=True, exist_ok=True)
         self.work = Path(os.environ.get('RUNNER_TEMP', '/tmp')) / ('reactor-comparison-' + str(os.getpid()))
@@ -255,6 +321,9 @@ class Comparison:
         metadata = {
             'classification': 'Shared-runner diagnostic, not an official challenge score',
             'mode': self.args.mode, 'commit': capture(['git', 'rev-parse', 'HEAD'], cwd=ROOT),
+            'host_block_id': self.host_block_id, 'replicate_index': self.args.replicate_index,
+            'order_seed': self.args.seed, 'replicate_rotation_offset': self.args.replicate_index,
+            'rounds_per_replica': self.args.rounds,
             'runner': {k: os.environ.get(k) for k in ('RUNNER_OS', 'RUNNER_ARCH', 'ImageOS', 'ImageVersion', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT')},
             'uname': capture(['uname', '-a']), 'lscpu': capture(['lscpu']),
             'cpu_affinity': self.cpus, 'memory': read_text('/proc/meminfo'),
@@ -278,6 +347,14 @@ class Comparison:
                         'syn_backlog': read_text('/proc/sys/net/ipv4/tcp_max_syn_backlog')},
             'seed_database': 'feed_seed', 'trial_database': TRIAL_DB,
             'gc_heap_hard_limit_percent': 60, 'no_separate_warmup': True,
+            'diagnostic_settling_policy': {
+                'grace_after_ramp_s': SETTLING_GRACE_S,
+                'initial_think_delay_max_s': 12.5,
+                'reason': 'Official mload sleeps between(0,5) seconds times think-scale 2.5 before each user first connects.',
+                'cpu_and_connection_checks_start': 'ramp + 15 seconds',
+                'latency_window_end_checks_start': 'ramp + 20 seconds, covering five seconds entirely after settling',
+                'official_results_and_raw_data': 'Unchanged; overall request metrics and CPU per successful request still include the ramp and settling period',
+            },
             'workload_sha256': source_hashes(ROOT / 'bench/mload'),
             'test_sha256': source_hashes(ROOT / 'test'), 'sources': {},
         }
@@ -402,7 +479,7 @@ class Comparison:
 
     def trial(self, entry, index):
         name, users = entry['variant'], entry['users']
-        trial_id = f'{index:03d}-{name}-{users}-r{entry["round"]}'
+        trial_id = f'p{self.args.replicate_index}-{index:03d}-{name}-{users}-r{entry["round"]}'
         folder = self.out / 'trials' / trial_id
         folder.mkdir(parents=True)
         reset_database()
@@ -420,6 +497,7 @@ class Comparison:
                    '-tokens', str(ROOT / 'seed/tokens.json'), '-gzip', '-think-scale', '2.5',
                    '-out', str(folder / 'mload.json')]
         config = {**entry, 'id': trial_id, 'ramp_s': ramp, 'hold_s': hold,
+                  'replicate_index': self.args.replicate_index, 'host_block_id': self.host_block_id,
                   'startup_seconds': startup, 'command': command}
         write_json(folder / 'config.json', config)
         try:
@@ -473,7 +551,9 @@ class Comparison:
         return self.results[-1]
 
     def report(self):
-        lines = ['# Shared-runner diagnostic', '',
+        pairs = paired_ratios(self.results)
+        write_json(self.out / 'paired-ratios.json', pairs)
+        lines = [f'# Shared-runner diagnostic — replica {self.args.replicate_index}', '',
                  'These results are not official challenge scores. CPU partitions, loopback traffic, co-hosted PostgreSQL, reduced database memory, and shared VM variability limit their interpretation.', '',
                  '| Variant | Users | Trials | Valid passes | Median p99 ms | p99 range ms | Median app CPU us/success | Peak app RSS MiB |',
                  '|---|---:|---:|---:|---:|---:|---:|---:|']
@@ -487,7 +567,17 @@ class Comparison:
                 lines.append(f'| {name} | {users} | {len(rows)} | {sum(r["valid_diagnostic_pass"] for r in rows)} | '
                              f'{statistics.median(p99):.1f} | {min(p99):.1f}–{max(p99):.1f} | '
                              f'{statistics.median(cpu) if cpu else float("nan"):.1f} | {max(r["app_peak_rss_bytes"] for r in rows)/1048576:.1f} |')
-        lines += ['', 'Inspect individual trial validity, errors, endpoint histograms, steady-state connection counts, and database/generator CPU before drawing performance conclusions. No winner is automatically selected. Overall percentiles include the ramp, as in the unchanged official generator. Window percentiles are retained separately and never averaged into an aggregate percentile.', '']
+        lines += ['', 'Paired ratios below compare trials on this runner at the same user count and round. Each ratio is candidate / baseline; values below 1 indicate a smaller measured value. Ratios are withheld when either trial fails diagnostic validity or latency/error thresholds. Invalid rows and observations remain in paired-ratios.json.', '',
+                  '| Candidate / baseline | Users | Round | Eligible | CPU ratio | p99 ratio | RSS ratio |',
+                  '|---|---:|---:|---|---:|---:|---:|']
+        for pair in pairs:
+            ratios = pair['candidate_over_baseline_ratios'] or {}
+            values = ['—' if ratios.get(metric) is None else f'{ratios[metric]:.3f}'
+                      for metric in ('cpu_us_per_successful_request', 'p99_ms', 'peak_rss_bytes')]
+            lines.append(f'| {pair["candidate"]} / {pair["baseline"]} | {pair["users"]} | '
+                         f'{pair["round"]} | {"yes" if pair["eligible_for_comparison"] else "excluded"} | ' + ' | '.join(values) + ' |')
+            print('PAIRED_RATIO ' + json.dumps(pair, separators=(',', ':')), flush=True)
+        lines += ['', 'Inspect individual trial validity, errors, endpoint histograms, steady-state connection counts, and database/generator CPU before drawing performance conclusions. No winner is automatically selected. Across replicas, compare valid within-host ratios and their range; do not pool raw CPU times or histograms from different hosts. Overall percentiles include the ramp, as in the unchanged official generator. Window percentiles are retained separately and never averaged into an aggregate percentile.', '']
         report = '\n'.join(lines)
         (self.out / 'report.md').write_text(report)
         print(report, flush=True)
@@ -502,6 +592,7 @@ def main():
     parser.add_argument('--mode', choices=('smoke', 'full', 'capacity'))
     parser.add_argument('--levels', help='Override comma-separated concurrent-user levels')
     parser.add_argument('--rounds', type=int)
+    parser.add_argument('--replicate-index', type=int, default=0, help='Host-replica ID and variant-order rotation offset')
     parser.add_argument('--app-cores', type=int, default=2, help='Default exercises two reactor workers; remaining non-generator CPUs go to PostgreSQL')
     parser.add_argument('--ramp', type=int, default=60)
     parser.add_argument('--hold', type=int)
@@ -517,13 +608,13 @@ def main():
     args.rounds = args.rounds or (1 if args.mode == 'smoke' else 3)
     args.hold = args.hold or (60 if args.mode == 'smoke' else 120)
     levels = [int(x) for x in args.levels.split(',')] if args.levels else ([15000] if args.mode == 'smoke' else [30000, 80000] if args.mode == 'full' else [10000, 30000, 100000])
-    if not levels or min(levels) < 1 or max(levels) > 100000 or args.rounds < 1 or args.ramp < 1 or args.hold < 1:
-        parser.error('Use positive timings/rounds and 1–100000 users')
+    if not levels or len(set(levels)) != len(levels) or min(levels) < 1 or max(levels) > 100000 or args.rounds < 1 or args.ramp < 1 or args.hold < 1 or args.replicate_index < 0:
+        parser.error('Use distinct levels of 1–100000 users, positive timings/rounds, and a nonnegative replica index')
     compare = Comparison(args)
     try:
         compare.prepare()
         compare.verify()
-        plan = schedule(compare.variants, levels, args.rounds, args.seed)
+        plan = schedule(compare.variants, levels, args.rounds, args.seed, args.replicate_index)
         write_json(compare.out / 'schedule.json', plan)
         print('SCHEDULE ' + json.dumps(plan), flush=True)
         for index, entry in enumerate(plan, 1):

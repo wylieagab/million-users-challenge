@@ -18,23 +18,27 @@ Commit `smoke`, `full`, or `capacity` to `mode.txt` on the fork experiment PR.
 The path-filtered workflow triggers on that change. It can also be run through
 GitHub's manual workflow button. All correctness checks precede any benchmark.
 
-| Mode | Required app builds | Users | Repetitions | Ramp / hold per trial |
+| Mode | Required app builds on every runner | Users | Replication | Ramp / hold per trial |
 |---|---|---|---|---|
-| smoke | New reactor | 15,000 | 1 | 60 s / 60 s |
-| full | Original + Kestrel AOT + Kestrel JIT + reactor | 30,000 and 80,000 | 3 | 60 s / 120 s |
-| capacity | Same four | 10,000, 30,000 and 100,000 | 3 | 60 s / 120 s |
+| smoke | New reactor | 15,000 | 1 runner, 1 round | 60 s / 60 s |
+| full | Original + Kestrel AOT + Kestrel JIT + reactor | 30,000 and 80,000 | 3 parallel runners, 1 round each | 60 s / 120 s |
+| capacity | Same four | 10,000, 30,000 and 100,000 | 3 parallel runners, 1 round each | 60 s / 120 s |
 
 The optional io_uring variant is added when its probe succeeds. Exit code 77
 records an unsupported platform and skips that variant. Other probe failures
 are errors. No sysctl, seccomp setting, or privilege is changed to enable it.
 The required epoll probe and optional io_uring probe exercise real socket
 readiness and rejection of stale events after descriptor re-registration.
-Full mode can take about 90–110 minutes when all five variants run. Capacity
-mode can take about 150 minutes. The job timeout is 180 minutes; additional
-levels or confirmations need a correspondingly bounded schedule.
+Every replica compares all available variants on its own host, with at most
+three jobs running in parallel. Full mode should take roughly 35–45 minutes;
+capacity mode roughly 50–65 minutes. Actual queue, download, build, and test
+times vary. The per-job timeout is 180 minutes. Total runner minutes increase
+because setup and correctness checks repeat, but no paid/larger runner is used.
 
 The driver also accepts `--levels 30000,80000`, `--rounds 3`, `--ramp 60`,
-`--hold 120`, `--app-cores 1`, and `--confirm`. Confirmation is a fresh process/database trial
+`--hold 120`, `--app-cores 1`, `--replicate-index 0`, and `--confirm`. Direct full
+mode defaults to three serial rounds; the workflow explicitly uses one round
+on each of three hosts. Confirmation is a fresh process/database trial
 with a 60-second ramp and a five-minute hold at each variant's highest level
 that passed all repeated trials without a detected generator/database CPU
 bottleneck. This bounded grid is not the challenge's maximum-user search.
@@ -59,10 +63,11 @@ python3 -u experiments/reactor-comparison/run.py --mode full --allow-disposable-
   isolated directory. The new server is copied from the tested commit. Source
   hashes, resolved dependencies, and build logs are saved.
 - SDK 10.0.403/runtime 10.0.14 and Go 1.27.1 are pinned. The setup downloads
-  their verified archives. PostgreSQL uses the `postgres:18` service image;
+  their verified archives. PostgreSQL uses the `postgres:18.6` service image,
+  pinned to digest `sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4`;
   the actual image ID, server settings/version, and host libpq 18 package
-  version are recorded. The PostgreSQL image/package patch is not frozen
-  across separate workflow runs. Comparisons belong within one job.
+  version are recorded. The host libpq package patch is not frozen across
+  separate workflow runs. Each raw comparison belongs within one runner.
 - Exactly one app and one generator run at a time. On a four-CPU runner,
   external `taskset` gives the app two logical CPUs and the generator one;
   Docker limits PostgreSQL to the fourth. This exercises per-core sharding.
@@ -97,9 +102,12 @@ python3 -u experiments/reactor-comparison/run.py --mode full --allow-disposable-
   time-based seed; repeated runs preserve the user model, not an identical
   request sequence.
 - A seeded shuffle followed by rotated variant order limits systematic
-  ordering bias; the entire order is saved. Three repeats are not a complete
-  Latin square with four or five variants. Median and range are descriptive;
-  no statistically significant winner or maximum capacity is declared.
+  ordering bias; the entire order and replica rotation are saved. Replicas
+  0/1/2 use the same three orders as three serial rounds when the same variants
+  are available. Three repeats are not a complete Latin square with four or
+  five variants. This exchanges within-host repetition for independent-host
+  replication; it does not remove hardware variation or establish statistical
+  significance from three observations.
 
 ## Evidence and interpretation
 
@@ -108,6 +116,22 @@ source hashes, resolved package locks/assets, schedules, raw mload histograms,
 endpoint counts/errors, connection and request latency, and one-second telemetry.
 Every raw result and compact summary is also printed in the job log. The final
 table reports all repetitions, including failed or resource-limited ones.
+
+Each artifact name, trial ID, and result identifies its replica. A unique host
+block ID prevents accidental pairing across runners, even if replica numbers
+are reused. `paired-ratios.json` and `PAIRED_RATIO` log lines compare candidate
+CPU per successful request, p99 latency, and peak RSS to the corresponding
+baseline at the same user count and round on the same runner. Ratios are
+candidate / baseline, so values below one mean a smaller measured value.
+They are emitted only when both trials pass diagnostic validity and the
+generator's latency/error thresholds. Excluded pairs retain both observations,
+status flags, and exclusion reasons; all underlying data remains available.
+
+Across hosts, summarize eligible paired ratios with their sample count, median,
+and range. Do not pool raw CPU times, RSS, or latency histograms across different
+machines. Optional io_uring pairs exist only on hosts where its probe succeeds.
+A ratio is evidence about one metric, not an automatic overall winner. Mixed
+directions, few valid pairs, or large variation require further measurement.
 
 App CPU time is read from process-wide `/proc/PID/stat` counters; app RSS is
 sampled with the process high-water mark. PostgreSQL CPU/memory comes from the
@@ -118,10 +142,21 @@ separately. Overall mload percentiles include ramp time, exactly as the official
 generator reports them. Hold-period window percentiles are retained individually;
 they are never averaged to fabricate an aggregate percentile.
 
+The unchanged generator initially sleeps `between(0, 5) * think-scale` before
+each user's first request. With think-scale 2.5, the last ramped users may wait
+up to another 12.5 seconds before connecting. Diagnostic CPU-utilization and
+connection-count checks therefore start 15 seconds after the ramp. Latency
+ticks summarize the preceding five seconds, so their diagnostic window check
+starts at ramp + 20 seconds to cover only complete windows after settling.
+For a 60-second ramp, these boundaries are 75 and 80 seconds respectively.
+Early connection counts, all request errors, overall latency histograms, and
+total app CPU per successful request remain recorded unchanged. This grace
+period is not a workload modification or a separate application warm-up.
+
 A diagnostic pass requires the generator's latency/error thresholds, a live
-app, at least 98% of requested connections throughout measured hold windows,
+app, at least 98% of requested connections throughout the post-settling hold windows,
 and neither generator nor database averaging 85% of its CPU allocation during
-the hold. That CPU heuristic flags an obvious confounder; it cannot prove the
+the post-settling hold. That CPU heuristic flags an obvious confounder; it cannot prove the
 absence of I/O, lock, network, or noisy-neighbor bottlenecks. Inspect telemetry,
 endpoint errors and repeat variance before attributing a tail-latency difference
 to the application. Low-load wins and high-variance measurements establish no
