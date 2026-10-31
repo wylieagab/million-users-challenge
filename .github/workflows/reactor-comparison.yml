@@ -50,10 +50,13 @@ jobs:
       - name: Correctness and controlled mixed workload
         env:
           PG_CONTAINER: ${{ job.services.postgres.id }}
-        run: >-
-          python3 -u experiments/reactor-comparison/run.py
-          --allow-disposable-database
-          --output "$GITHUB_WORKSPACE/reactor-results"
+        run: |
+          printf 'Inherited NOFILE: soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
+          sudo -n prlimit --pid "$$" --nofile=1048576:1048576
+          printf 'Trial NOFILE: soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
+          exec python3 -u experiments/reactor-comparison/run.py \
+            --allow-disposable-database \
+            --output "$GITHUB_WORKSPACE/reactor-results"
       - name: Preserve raw evidence even after failure
         if: always()
         uses: actions/upload-artifact@v4

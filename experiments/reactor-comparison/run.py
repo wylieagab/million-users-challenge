@@ -237,7 +237,9 @@ class Comparison:
         descriptor_limit = 2_097_152 if hard == resource.RLIM_INFINITY else min(hard, 2_097_152)
         resource.setrlimit(resource.RLIMIT_NOFILE, (descriptor_limit, hard))
         if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 262144:
-            raise RuntimeError('Need a process file-descriptor limit of at least 262144')
+            raise RuntimeError(f'Need a process file-descriptor limit of at least 262144; '
+                               f'inherited soft={soft}, hard={hard}; '
+                               f'current={resource.getrlimit(resource.RLIMIT_NOFILE)}')
         capture(['docker', 'update', '--cpuset-cpus', ','.join(map(str, self.cpus['database'])), self.container])
         pgpid = capture(['docker', 'inspect', '--format', '{{.State.Pid}}', self.container])
         for line in Path(f'/proc/{pgpid}/cgroup').read_text().splitlines():
