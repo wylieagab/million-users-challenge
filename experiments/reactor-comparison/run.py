@@ -480,7 +480,9 @@ class Comparison:
         log.close()
 
     def verify(self):
-        for name in self.variants:
+        # Exercise the new native implementation before spending time on frozen
+        # controls. Measurement order remains the independent rotated schedule.
+        for name in sorted(self.variants, key=lambda value: not value.startswith('reactor-')):
             reset_database()
             folder = self.out / 'correctness' / name
             folder.mkdir(parents=True)

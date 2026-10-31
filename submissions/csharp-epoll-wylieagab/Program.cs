@@ -1,6 +1,9 @@
 using MillionReactor;
 
 if (!OperatingSystem.IsLinux()) throw new PlatformNotSupportedException("Run this reactor on Linux x86_64.");
+// Initializing the console writer can require another descriptor. Do it before
+// accepting sockets so reporting EMFILE does not itself fail with EMFILE.
+_ = Console.Error;
 if (args.Contains("--probe-epoll", StringComparer.Ordinal))
 {
     Console.WriteLine(EpollPoller.Probe());
