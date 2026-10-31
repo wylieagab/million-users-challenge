@@ -123,6 +123,8 @@ internal sealed unsafe partial class UringPoller : IEventPoller
             Cancel(registration.Token);
     }
 
+    public bool IsCurrent(PollEvent ev) => watched.TryGetValue(ev.FileDescriptor, out Registration current) && current.Token == ev.Token;
+
     public int Wait(Span<PollEvent> events, int timeoutMs)
     {
         ObjectDisposedException.ThrowIf(ring == 0, this);
@@ -153,7 +155,7 @@ internal sealed unsafe partial class UringPoller : IEventPoller
                 int fd = (int)(uint)completed.Token;
                 if (!watched.TryGetValue(fd, out Registration registration) || registration.Token != completed.Token)
                     continue;
-                events[count++] = new(fd, completed.Events);
+                events[count++] = new(fd, completed.Events, completed.Token);
                 rearm.Add(completed.Token);
             }
             if (count != 0) return count;
@@ -246,36 +248,8 @@ internal sealed unsafe partial class UringPoller : IEventPoller
     internal static string Probe()
     {
         using var poller = new UringPoller();
-        int* sockets = stackalloc int[2];
-        if (SocketPair(1, 1 | 0x800 | 0x80000, 0, sockets) != 0)
-            throw new IOException($"socketpair probe failed: {new Win32Exception(Marshal.GetLastPInvokeError()).Message}");
-        try
-        {
-            Span<PollEvent> events = stackalloc PollEvent[4];
-            poller.Watch(sockets[0], 1 | 8192);
-            poller.Watch(sockets[0], 1 | 8192);
-            byte value = 37;
-            if (Write(sockets[1], &value, 1) != 1) throw new IOException("io_uring probe socket write failed.");
-            int count = poller.Wait(events, 1000);
-            if (count != 1 || events[0].FileDescriptor != sockets[0] || (events[0].Events & 1) == 0)
-                throw new IOException("io_uring probe did not return input readiness.");
-            if (Read(sockets[0], &value, 1) != 1 || value != 37) throw new IOException("io_uring probe socket read failed.");
-            poller.Remove(sockets[0]);
-            poller.Watch(sockets[0], 1);
-            poller.Watch(sockets[0], 1 | 4);
-            count = poller.Wait(events, 1000);
-            if (count != 1 || events[0].FileDescriptor != sockets[0] || (events[0].Events & 4) == 0)
-                throw new IOException("io_uring probe did not preserve replacement registration readiness.");
-            poller.Remove(sockets[0]);
-            if (poller.Wait(events, 0) != 0) throw new IOException("io_uring probe returned removed readiness.");
-            return "liburing-ffi 2.5; POLL_ADD/POLL_REMOVE; NODROP; socketpair readiness and replacement passed";
-        }
-        finally
-        {
-            poller.Remove(sockets[0]);
-            Close(sockets[0]);
-            Close(sockets[1]);
-        }
+        PollerProbe.Check(poller);
+        return "liburing-ffi 2.5; POLL_ADD/POLL_REMOVE; NODROP; readiness, stale registration rejection and replacement passed";
     }
 
     public void Dispose()
@@ -306,10 +280,6 @@ internal sealed unsafe partial class UringPoller : IEventPoller
     [LibraryImport(Library, EntryPoint = "io_uring_cq_advance")] private static partial void CqAdvance(nint ring, uint count);
     [LibraryImport(Library, EntryPoint = "io_uring_wait_cqe")] private static partial int WaitCqe(nint ring, nint* completion);
     [LibraryImport(Library, EntryPoint = "io_uring_wait_cqe_timeout")] private static partial int WaitCqeTimeout(nint ring, nint* completion, KernelTimespec* timeout);
-    [LibraryImport("libc.so.6", EntryPoint = "socketpair", SetLastError = true)] private static partial int SocketPair(int domain, int type, int protocol, int* sockets);
-    [LibraryImport("libc.so.6", EntryPoint = "write", SetLastError = true)] private static partial nint Write(int fd, byte* data, nuint length);
-    [LibraryImport("libc.so.6", EntryPoint = "read", SetLastError = true)] private static partial nint Read(int fd, byte* data, nuint length);
-    [LibraryImport("libc.so.6", EntryPoint = "close")] private static partial int Close(int fd);
 }
 
 internal sealed class UringUnavailableException(string message, Exception? inner = null) : NotSupportedException(message, inner);

@@ -119,6 +119,17 @@ def main():
                 print(f'PASS {port}: fragmented headers/body/UTF-8, pipelined requests, chunked POST, response framing, Connection: close', flush=True)
             finally:
                 connection.close()
+            half_closed = Connection(port)
+            try:
+                half_closed.send(get('/posts/1') + get('/health') + get('/feed'))
+                half_closed.socket.shutdown(socket.SHUT_WR)
+                assert half_closed.response()[1]['post']['id'] == 1
+                assert half_closed.response()[1]['status'] == 'ok'
+                assert len(half_closed.response()[1]['posts']) == 20
+                assert half_closed.socket.recv(1) == b'', 'Half-closed request stream did not finish after its queued responses'
+                print(f'PASS {port}: all three pipelined responses survive client write-half-close', flush=True)
+            finally:
+                half_closed.close()
             idle = Connection(port)
             idle.send(get('/health'))
             assert idle.response()[0] == 200

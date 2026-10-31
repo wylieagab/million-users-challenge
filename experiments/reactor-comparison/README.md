@@ -27,9 +27,11 @@ GitHub's manual workflow button. All correctness checks precede any benchmark.
 The optional io_uring variant is added when its probe succeeds. Exit code 77
 records an unsupported platform and skips that variant. Other probe failures
 are errors. No sysctl, seccomp setting, or privilege is changed to enable it.
+The required epoll probe and optional io_uring probe exercise real socket
+readiness and rejection of stale events after descriptor re-registration.
 Full mode can take about 90–110 minutes when all five variants run. Capacity
-mode can approach the 150-minute job timeout; use a dedicated longer job for
-additional levels or confirmations.
+mode can take about 150 minutes. The job timeout is 180 minutes; additional
+levels or confirmations need a correspondingly bounded schedule.
 
 The driver also accepts `--levels 30000,80000`, `--rounds 3`, `--ramp 60`,
 `--hold 120`, `--app-cores 1`, and `--confirm`. Confirmation is a fresh process/database trial
@@ -81,7 +83,10 @@ python3 -u experiments/reactor-comparison/run.py --mode full --allow-disposable-
   driver checks their Git diff against the frozen repository base. Every
   variant runs the 42 official assertions, the existing extended HTTP suite,
   and independent raw TCP checks for fragmented headers/bodies, UTF-8,
-  chunking, pipelining, framing, connection-close, and 76-second idle reuse.
+  chunking, pipelining, framing, write-half-close with queued responses,
+  connection-close, and 76-second idle reuse. Reactor variants additionally
+  run their database-pipeline regression, including failed writes followed by
+  successful commands and concurrent mixed outcomes with readback.
   The unchanged original example is a control: extra-test failures are
   preserved and displayed without patching its code. Its official tests
   must pass. All extra tests are mandatory for our implementations.

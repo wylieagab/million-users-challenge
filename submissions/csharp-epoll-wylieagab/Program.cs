@@ -1,9 +1,14 @@
 using MillionReactor;
 
 if (!OperatingSystem.IsLinux()) throw new PlatformNotSupportedException("Run this reactor on Linux x86_64.");
+if (args.Contains("--probe-epoll", StringComparer.Ordinal))
+{
+    Console.WriteLine(EpollPoller.Probe());
+    return;
+}
 if (args.Contains("--probe-io-uring", StringComparer.Ordinal))
 {
-    try { UringPoller.Probe(); Console.WriteLine("io_uring poll available"); return; }
+    try { Console.WriteLine(UringPoller.Probe()); return; }
     catch (UringUnavailableException ex) { Console.Error.WriteLine(ex.Message); Environment.Exit(77); return; }
 }
 static string Env(string name, string? fallback = null) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value

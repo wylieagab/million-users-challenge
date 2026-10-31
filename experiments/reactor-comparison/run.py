@@ -305,6 +305,14 @@ class Comparison:
             if resolved.exists():
                 shutil.copyfile(resolved, self.out / f'{name}-project.assets.json')
         reactor = self.variants['reactor-epoll']['folder']
+        epoll_probe = logged([str(reactor / 'out/FeedApi'), '--probe-epoll'], self.out / 'epoll-probe.log',
+                             cwd=reactor, env=self.env, timeout=30, check=False)
+        metadata['epoll_probe'] = {'exit_code': epoll_probe,
+                                   'output': (self.out / 'epoll-probe.log').read_text(errors='replace')}
+        print('EPOLL_PROBE ' + json.dumps(metadata['epoll_probe']), flush=True)
+        write_json(self.out / 'environment.json', metadata)
+        if epoll_probe != 0:
+            raise RuntimeError('Required epoll readiness/stale-event probe failed')
         probe = logged([str(reactor / 'out/FeedApi'), '--probe-io-uring'], self.out / 'io-uring-probe.log',
                        cwd=reactor, env=self.env, timeout=30, check=False)
         metadata['io_uring']['probe_exit_code'] = probe
@@ -373,13 +381,19 @@ class Comparison:
                     folder / 'extended.log', env=self.env, timeout=180, check=False)
                 result['transport_exit'] = logged([sys.executable, str(HERE / 'transport-check.py')],
                     folder / 'transport.log', env=self.env, timeout=180, check=False)
-                for test in ('official', 'extended', 'transport'):
+                tests = ['official', 'extended', 'transport']
+                if name.startswith('reactor-'):
+                    pipeline = self.variants[name]['folder'] / 'tests/pipeline-check.py'
+                    result['pipeline_exit'] = logged([sys.executable, str(pipeline)],
+                        folder / 'pipeline.log', env=dict(self.env, BASE_URL='http://127.0.0.1:3000'), timeout=180, check=False)
+                    tests.append('pipeline')
+                for test in tests:
                     print(f'CORRECTNESS_LOG {name} {test}\n' + (folder / f'{test}.log').read_text(errors='replace')[-16000:], flush=True)
                 self.correctness[name] = result
                 write_json(self.out / 'correctness.json', self.correctness)
                 # The unchanged example is a control. Preserve its extra-test
                 # failures explicitly instead of silently changing its source.
-                if result['official_exit'] or (name != 'minimal-api' and (result['extended_exit'] or result['transport_exit'])):
+                if result['official_exit'] or (name != 'minimal-api' and (result['extended_exit'] or result['transport_exit'] or result.get('pipeline_exit', 0))):
                     raise RuntimeError(f'Correctness failed for {name}; benchmark not started')
             finally:
                 self.stop(process, log)

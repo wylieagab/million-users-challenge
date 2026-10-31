@@ -44,6 +44,8 @@ internal sealed class Worker : IDisposable
             for (int i = 0; i < ready; i++)
             {
                 var ev = events[i];
+                // Earlier callbacks in this batch may close and reuse this fd.
+                if (!poller.IsCurrent(ev)) continue;
                 if (database.Owns(ev.FileDescriptor)) database.OnReady(ev.FileDescriptor);
                 else if (Array.IndexOf(listeners, ev.FileDescriptor) >= 0) Accept(ev.FileDescriptor);
                 else if (clients.TryGetValue(ev.FileDescriptor, out var client))
@@ -51,12 +53,6 @@ internal sealed class Worker : IDisposable
                     if ((ev.Events & (Linux.Error | Linux.Hangup)) != 0) { client.Close(); continue; }
                     if ((ev.Events & Linux.Read) != 0 && !client.Busy) client.Read();
                     if (!client.Closed && (ev.Events & Linux.Write) != 0) client.Flush();
-                    // Read queued bytes before treating a peer's write-half shutdown as EOF.
-                    if (!client.Closed && (ev.Events & Linux.ReadHangup) != 0)
-                    {
-                        client.PeerEnded = true;
-                        if (!client.Busy && client.InputCount == 0) client.Close();
-                    }
                 }
             }
             long second = Environment.TickCount64 / 1000;
@@ -96,7 +92,9 @@ internal sealed class Worker : IDisposable
             catch { Linux.close(fd); throw; }
         }
     }
-    private void Watch(Client client, uint events) => poller.Watch(client.Fd, events | Linux.ReadHangup);
+    // FIN is reported as readable EOF. Do not watch RDHUP while database work
+    // is pending: level-triggered half-close notifications would spin the loop.
+    private void Watch(Client client, uint events) => poller.Watch(client.Fd, events);
     private void DetachTimer(Client client)
     {
         if (client.Bucket < 0) return;
@@ -189,7 +187,7 @@ internal sealed class Worker : IDisposable
         {
             input ??= ArrayPool<byte>.Shared.Rent(4096);
             // A partial request is bounded independently from the idle socket count.
-            while (true)
+            for (int reads = 0; reads < 16; reads++)
             {
                 if (InputCount == input.Length)
                 {
@@ -210,19 +208,33 @@ internal sealed class Worker : IDisposable
                     input ??= ArrayPool<byte>.Shared.Rent(4096);
                     continue;
                 }
-                if (read == 0) { PeerEnded = true; if (!Busy) Close(); return; }
+                if (read == 0)
+                {
+                    PeerEnded = true;
+                    worker.Watch(this, 0);
+                    if (InputCount == 0) Close();
+                    else worker.buffered.Enqueue(this);
+                    return;
+                }
                 int errno = Marshal.GetLastPInvokeError();
                 if (errno == 4) continue;
                 if (errno != 11) Close();
                 else if (InputCount == 0) ReleaseInput();
                 return;
             }
+            // Bound work even when every request completes synchronously.
+            if (InputCount == 0) ReleaseInput();
+            else worker.buffered.Enqueue(this);
         }
         public void Dispatch()
         {
             if (Closed || Busy || input is null || InputCount == 0) return;
             int parsed = HttpParser.Parse(input.AsSpan(0, InputCount), out var request);
-            if (parsed == 0) return;
+            if (parsed == 0)
+            {
+                if (PeerEnded) Error(400, "incomplete request", close: true);
+                return;
+            }
             if (parsed < 0) { Error(400, "bad request", close: true); return; }
             gzip = request!.Gzip;
             closeAfter = request.Close;
@@ -260,7 +272,7 @@ internal sealed class Worker : IDisposable
                 404 => "Not Found", 413 => "Content Too Large", 503 => "Service Unavailable", _ => "Internal Server Error" };
             string header = $"HTTP/1.1 {response.Status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nVary: Accept-Encoding\r\n"
                 + (compressed ? "Content-Encoding: gzip\r\n" : "")
-                + (closeAfter || PeerEnded ? "Connection: close\r\n" : "") + "\r\n";
+                + (closeAfter || (PeerEnded && InputCount == 0) ? "Connection: close\r\n" : "") + "\r\n";
             int headerLength = Encoding.ASCII.GetByteCount(header);
             output = new byte[headerLength + body.Length];
             Encoding.ASCII.GetBytes(header, output);
@@ -284,9 +296,9 @@ internal sealed class Worker : IDisposable
             output = null;
             Busy = false;
             worker.completed++;
-            if (closeAfter || PeerEnded) { Close(); return; }
+            if (closeAfter || (PeerEnded && InputCount == 0)) { Close(); return; }
             worker.Touch(this);
-            worker.Watch(this, Linux.Read);
+            worker.Watch(this, PeerEnded ? 0 : Linux.Read);
             if (InputCount > 0) worker.buffered.Enqueue(this);
         }
         private void ReleaseInput()

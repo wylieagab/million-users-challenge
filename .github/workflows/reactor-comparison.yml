@@ -16,7 +16,7 @@ jobs:
   compare:
     if: github.repository_owner == 'wylieagab'
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     services:
       postgres:
         image: postgres:18
@@ -24,6 +24,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
         ports: ['5432:5432']
         options: >-
+          --shm-size=2g
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s --health-timeout 5s --health-retries 20
     env:
@@ -33,7 +34,6 @@ jobs:
       PGPASSWORD: postgres
       PGCLIENTENCODING: UTF8
       JWT_SECRET: million-users-challenge
-      PG_CONTAINER: ${{ job.services.postgres.id }}
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
       DOTNET_NOLOGO: '1'
     steps:
@@ -44,8 +44,12 @@ jobs:
       - name: Check measurement and scheduling invariants
         run: python3 experiments/reactor-comparison/test_driver.py
       - name: Prepare pinned tools, database settings, and unchanged seed
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
         run: bash experiments/reactor-comparison/prepare.sh
       - name: Correctness and controlled mixed workload
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
         run: >-
           python3 -u experiments/reactor-comparison/run.py
           --allow-disposable-database
