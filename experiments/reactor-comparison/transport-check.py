@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Valid HTTP/1.1 fragmentation, chunking, pipelining, and idle connection checks."""
+import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import socket
+import threading
 import time
+import traceback
 
 
 def signed_token():
@@ -20,13 +26,27 @@ def signed_token():
 
 class Connection:
     def __init__(self, port):
+        self.deadline = time.monotonic() + 15
         self.socket = socket.create_connection(('127.0.0.1', port), timeout=15)
         self.buffer = b''
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
     def close(self):
         self.socket.close()
 
+    def check_deadline(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Transport case exceeded its 15-second I/O deadline')
+        self.socket.settimeout(remaining)
+
     def receive(self):
+        self.check_deadline()
         data = self.socket.recv(65536)
         if not data:
             raise AssertionError('Unexpected EOF while reading a complete response')
@@ -69,12 +89,19 @@ class Connection:
             position = 0
             widths = [1, 2, 7, 3, 19, 1, 5]
             while position < len(data):
+                self.check_deadline()
                 width = widths[position % len(widths)]
                 self.socket.sendall(data[position:position + width])
                 position += width
                 time.sleep(.001)
         else:
+            self.check_deadline()
             self.socket.sendall(data)
+
+    def expect_eof(self):
+        assert not self.buffer, 'Unexpected bytes remain after the final response'
+        self.check_deadline()
+        assert self.socket.recv(1) == b'', 'Expected EOF after the final response'
 
 
 def get(path, close=False):
@@ -82,68 +109,147 @@ def get(path, close=False):
             f'Connection: {"close" if close else "keep-alive"}\r\n\r\n').encode()
 
 
-def main():
-    token = signed_token()
-    idle_connections = []
-    try:
-        for port in (3000, 3001):
-            connection = Connection(port)
-            try:
-                connection.send(get('/health'), fragmented=True)
-                status, value = connection.response()
-                assert status == 200 and value['status'] == 'ok' and value['db'] == 'ok'
-                # All requests are coalesced into one write; responses must remain ordered.
-                connection.send(get('/posts/1') + get('/health') + get('/feed'))
-                assert connection.response()[1]['post']['id'] == 1
-                assert connection.response()[1]['status'] == 'ok'
-                assert len(connection.response()[1]['posts']) == 20
-                body_text = 'fragmented HTTP UTF-8: café 😀 newline\nquote" slash\\'
-                body = json.dumps({'body': body_text}, ensure_ascii=False).encode()
-                common = (f'POST /posts HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n'
-                          'Content-Type: application/json\r\n').encode()
-                connection.send(common + f'Content-Length: {len(body)}\r\n\r\n'.encode() + body, fragmented=True)
-                status, value = connection.response()
-                assert status == 201 and value['post']['body'] == body_text
-                connection.send(get('/posts/' + str(value['post']['id'])))
-                assert connection.response()[1]['post']['body'] == body_text
-                chunks = b''.join(f'{len(body[i:i+7]):x}\r\n'.encode() + body[i:i+7] + b'\r\n' for i in range(0, len(body), 7))
-                # Follow the zero chunk immediately with a pipelined GET. The
-                # parser must consume exactly one request, leaving the next intact.
-                connection.send(common + b'Transfer-Encoding: chunked\r\n\r\n' + chunks + b'0\r\n\r\n' + get('/health'), fragmented=True)
-                status, value = connection.response()
-                assert status == 201 and value['post']['body'] == body_text
-                assert connection.response()[1]['status'] == 'ok'
-                connection.send(get('/health', close=True))
-                assert connection.response()[0] == 200
-                assert connection.socket.recv(1) == b'', 'Connection: close was not honored'
-                print(f'PASS {port}: fragmented headers/body/UTF-8, pipelined requests, chunked POST, response framing, Connection: close', flush=True)
-            finally:
-                connection.close()
-            half_closed = Connection(port)
-            try:
-                half_closed.send(get('/posts/1') + get('/health') + get('/feed'))
-                half_closed.socket.shutdown(socket.SHUT_WR)
-                assert half_closed.response()[1]['post']['id'] == 1
-                assert half_closed.response()[1]['status'] == 'ok'
-                assert len(half_closed.response()[1]['posts']) == 20
-                assert half_closed.socket.recv(1) == b'', 'Half-closed request stream did not finish after its queued responses'
-                print(f'PASS {port}: all three pipelined responses survive client write-half-close', flush=True)
-            finally:
-                half_closed.close()
-            idle = Connection(port)
-            idle.send(get('/health'))
-            assert idle.response()[0] == 200
-            idle_connections.append(idle)
-        print('Checking the same two sockets after 76 seconds idle...', flush=True)
+def expect_health(connection):
+    status, value = connection.response()
+    assert status == 200 and value['status'] == 'ok' and value['db'] == 'ok'
+
+
+def expect_pipeline(connection):
+    status, value = connection.response()
+    assert status == 200 and value['post']['id'] == 1
+    expect_health(connection)
+    status, value = connection.response()
+    assert status == 200 and len(value['posts']) == 20
+
+
+def post_payload(token):
+    text = 'fragmented HTTP UTF-8: café 😀 newline\nquote" slash\\'
+    body = json.dumps({'body': text}, ensure_ascii=False).encode()
+    headers = (f'POST /posts HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n'
+               'Content-Type: application/json\r\n').encode()
+    return headers, body, text
+
+
+def fragmented_headers(port):
+    with Connection(port) as connection:
+        connection.send(get('/health'), fragmented=True)
+        expect_health(connection)
+
+
+def pipelined_gets(port):
+    with Connection(port) as connection:
+        connection.send(get('/posts/1') + get('/health') + get('/feed'))
+        expect_pipeline(connection)
+
+
+def fragmented_post(port, *, token):
+    headers, body, text = post_payload(token)
+    with Connection(port) as connection:
+        connection.send(headers + f'Content-Length: {len(body)}\r\n\r\n'.encode() + body, fragmented=True)
+        status, value = connection.response()
+        assert status == 201 and value['post']['body'] == text
+        connection.send(get('/posts/' + str(value['post']['id'])))
+        status, value = connection.response()
+        assert status == 200 and value['post']['body'] == text
+
+
+def chunked_post_and_pipeline(port, *, token):
+    headers, body, text = post_payload(token)
+    chunks = b''.join(f'{len(body[i:i+7]):x}\r\n'.encode() + body[i:i+7] + b'\r\n' for i in range(0, len(body), 7))
+    with Connection(port) as connection:
+        connection.send(headers + b'Transfer-Encoding: chunked\r\n\r\n' + chunks + b'0\r\n\r\n' + get('/health'), fragmented=True)
+        status, value = connection.response()
+        assert status == 201 and value['post']['body'] == text
+        expect_health(connection)
+
+
+def connection_close(port):
+    with Connection(port) as connection:
+        connection.send(get('/health', close=True))
+        expect_health(connection)
+        connection.expect_eof()
+
+
+def write_half_close(port):
+    with Connection(port) as connection:
+        connection.send(get('/posts/1') + get('/health') + get('/feed'))
+        connection.socket.shutdown(socket.SHUT_WR)
+        expect_pipeline(connection)
+        connection.expect_eof()
+
+
+def idle_keepalive(port):
+    with Connection(port) as connection:
+        connection.send(get('/health'))
+        expect_health(connection)
         time.sleep(76)
-        for connection in idle_connections:
-            connection.send(get('/health'))
-            assert connection.response()[0] == 200
-        print('PASS both original sockets remained usable after 76 seconds idle', flush=True)
-    finally:
-        for connection in idle_connections:
-            connection.close()
+        connection.deadline = time.monotonic() + 15
+        connection.send(get('/health'))
+        expect_health(connection)
+
+
+class Suite:
+    def __init__(self, output=None):
+        self.output = Path(output) if output else None
+        self.lock = threading.Lock()
+        self.result = {'schema_version': 1, 'suite': 'http11-transport', 'complete': False, 'cases': []}
+        self.save()
+
+    def save(self):
+        cases = self.result['cases']
+        self.result['summary'] = {'passed': sum(c['status'] == 'passed' for c in cases),
+                                  'failed': sum(c['status'] == 'failed' for c in cases), 'total': len(cases)}
+        if self.output:
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.output.with_suffix(self.output.suffix + '.tmp')
+            temporary.write_text(json.dumps(self.result, indent=2) + '\n', encoding='utf-8')
+            temporary.replace(self.output)
+
+    def run(self, name, port, operation):
+        started = time.monotonic()
+        case = {'name': name, 'port': port, 'status': 'passed'}
+        try:
+            operation(port)
+        except Exception as error:
+            case.update(status='failed', error_type=type(error).__name__, error=str(error),
+                        traceback=traceback.format_exc())
+        case['elapsed_s'] = time.monotonic() - started
+        with self.lock:
+            self.result['cases'].append(case)
+            self.save()
+            print('TRANSPORT_CASE ' + json.dumps(case, separators=(',', ':')), flush=True)
+        return case
+
+    def finish(self):
+        self.result['complete'] = True
+        self.save()
+        print('TRANSPORT_SUMMARY ' + json.dumps(self.result['summary']), flush=True)
+        return 1 if self.result['summary']['failed'] else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, help='Per-case JSON artifact, updated after every completed case')
+    args = parser.parse_args()
+    token = signed_token()
+    suite = Suite(args.output)
+    cases = [('fragmented_headers', fragmented_headers),
+             ('pipelined_gets', pipelined_gets),
+             ('fragmented_utf8_post_and_readback', partial(fragmented_post, token=token)),
+             ('chunked_post_and_pipelined_get', partial(chunked_post_and_pipeline, token=token)),
+             ('connection_close', connection_close),
+             ('write_half_close_drains_three_responses', write_half_close)]
+    for port in (3000, 3001):
+        for name, operation in cases:
+            suite.run(name, port, operation)
+    # Separate sockets and results; wait only once for the two idle checks.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(suite.run, 'idle_keepalive_76_seconds', port, idle_keepalive)
+                   for port in (3000, 3001)]
+        for future in futures:
+            future.result()
+    return suite.finish()
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

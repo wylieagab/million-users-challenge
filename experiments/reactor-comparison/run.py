@@ -239,6 +239,22 @@ def paired_ratios(results):
     return pairs
 
 
+def correctness_verdict(name, result):
+    required = ['official']
+    if name != 'minimal-api':
+        required.append('extended')
+    if name.startswith('reactor-'):
+        required.extend(['transport', 'pipeline'])
+        # Additional reactor-only suites (for example worker regressions) are
+        # mandatory when integrated; an exit code can never silently be ignored.
+        required.extend(sorted(key[:-5] for key in result if key.endswith('_exit') and key[:-5] not in required))
+    blocking = [suite for suite in required if result.get(suite + '_exit') != 0]
+    observational = sorted(key[:-5] for key, value in result.items()
+                           if key.endswith('_exit') and value != 0 and key[:-5] not in required)
+    return {'required_suites': required, 'blocking_failures': blocking,
+            'observational_failures': observational}
+
+
 def extract(ref, source, destination):
     prefix = PurePosixPath(source)
     if prefix.is_absolute() or not prefix.parts or '..' in prefix.parts or '\\' in source:
@@ -475,22 +491,36 @@ class Comparison:
                     folder / 'official.log', env=self.env, timeout=180, check=False)
                 result['extended_exit'] = logged(['node', str(self.extended), 'http://127.0.0.1:3000', 'http://127.0.0.1:3001'],
                     folder / 'extended.log', env=self.env, timeout=180, check=False)
-                result['transport_exit'] = logged([sys.executable, str(HERE / 'transport-check.py')],
-                    folder / 'transport.log', env=self.env, timeout=180, check=False)
+                transport_cases = folder / 'transport-cases.json'
+                result['transport_exit'] = logged([sys.executable, str(HERE / 'transport-check.py'),
+                    '--output', str(transport_cases)], folder / 'transport.log', env=self.env, timeout=300, check=False)
+                case_results = json.loads(transport_cases.read_text())
+                if not case_results.get('complete'):
+                    raise RuntimeError(f'Transport suite did not finish for {name}; inspect {transport_cases}')
+                result['transport_cases_artifact'] = str(transport_cases.relative_to(self.out))
+                result['transport_cases_summary'] = case_results['summary']
                 tests = ['official', 'extended', 'transport']
                 if name.startswith('reactor-'):
                     pipeline = self.variants[name]['folder'] / 'tests/pipeline-check.py'
                     result['pipeline_exit'] = logged([sys.executable, str(pipeline)],
                         folder / 'pipeline.log', env=dict(self.env, BASE_URL='http://127.0.0.1:3000'), timeout=180, check=False)
                     tests.append('pipeline')
+                    worker = self.variants[name]['folder'] / 'tests/worker-check.py'
+                    result['worker_exit'] = logged([sys.executable, str(worker),
+                        '--binary', str(self.variants[name]['folder'] / 'out/FeedApi'),
+                        '--backend', 'io-uring' if name == 'reactor-uring' else 'epoll'],
+                        folder / 'worker.log', env=self.env, timeout=180, check=False)
+                    tests.append('worker')
                 for test in tests:
                     print(f'CORRECTNESS_LOG {name} {test}\n' + (folder / f'{test}.log').read_text(errors='replace')[-16000:], flush=True)
+                result.update(correctness_verdict(name, result))
                 self.correctness[name] = result
                 write_json(self.out / 'correctness.json', self.correctness)
-                # The unchanged example is a control. Preserve its extra-test
-                # failures explicitly instead of silently changing its source.
-                if result['official_exit'] or (name != 'minimal-api' and (result['extended_exit'] or result['transport_exit'] or result.get('pipeline_exit', 0))):
-                    raise RuntimeError(f'Correctness failed for {name}; benchmark not started')
+                print('CORRECTNESS_VERDICT ' + json.dumps({'variant': name, **result}, separators=(',', ':')), flush=True)
+                # Frozen controls keep their original behavior. Their new
+                # transport differences remain visible; reactor failures block.
+                if result['blocking_failures']:
+                    raise RuntimeError(f'Correctness failed for {name}: {result["blocking_failures"]}; benchmark not started')
             finally:
                 self.stop(process, log)
 
@@ -571,9 +601,19 @@ class Comparison:
         pairs = paired_ratios(self.results)
         write_json(self.out / 'paired-ratios.json', pairs)
         lines = [f'# Shared-runner diagnostic — replica {self.args.replicate_index}', '',
-                 'These results are not official challenge scores. CPU partitions, loopback traffic, co-hosted PostgreSQL, reduced database memory, and shared VM variability limit their interpretation.', '',
-                 '| Variant | Users | Trials | Valid passes | Median p99 ms | p99 range ms | Median app CPU us/success | Peak app RSS MiB |',
-                 '|---|---:|---:|---:|---:|---:|---:|---:|']
+                 'These results are not official challenge scores. CPU partitions, loopback traffic, co-hosted PostgreSQL, reduced database memory, and shared VM variability limit their interpretation.', '']
+        if self.correctness:
+            lines += ['Correctness outcomes: observational failures are retained differences in frozen controls, not passing assertions. See each transport-cases.json for every executed case.', '',
+                      '| Variant | Blocking failures | Observational failures | Transport cases passed / failed |',
+                      '|---|---|---|---|']
+            for name, result in self.correctness.items():
+                cases = result.get('transport_cases_summary', {})
+                lines.append(f'| {name} | {", ".join(result["blocking_failures"]) or "none"} | '
+                             f'{", ".join(result["observational_failures"]) or "none"} | '
+                             f'{cases.get("passed", "—")} / {cases.get("failed", "—")} |')
+            lines.append('')
+        lines += ['| Variant | Users | Trials | Valid passes | Median p99 ms | p99 range ms | Median app CPU us/success | Peak app RSS MiB |',
+                  '|---|---:|---:|---:|---:|---:|---:|---:|']
         for name in self.variants:
             for users in sorted({r['users'] for r in self.results}):
                 rows = [r for r in self.results if r['variant'] == name and r['users'] == users and not r.get('confirmation')]

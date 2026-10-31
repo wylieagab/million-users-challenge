@@ -9,6 +9,10 @@ namespace MillionReactor;
 
 internal sealed class Worker : IDisposable
 {
+    private const int AcceptBackoffMilliseconds = 100;
+    private static readonly DbResponse HealthBusy = new(503,
+        "{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"server busy\"}"u8.ToArray());
+    private static readonly DbResponse BusyResponse = new(503, "{\"error\":\"server busy\"}"u8.ToArray());
     private readonly IEventPoller poller;
     private readonly PgShard database;
     private readonly byte[] key;
@@ -19,6 +23,9 @@ internal sealed class Worker : IDisposable
     private long lastSecond = Environment.TickCount64 / 1000;
     private readonly int index;
     private long completed;
+    private long acceptedClients, listenerBackoffs, acceptErrorLogs;
+    private long acceptRetryAt, nextAcceptErrorLogAt;
+    private int maxContinuations;
     public Worker(int index, int count, string url, string host, int[] ports, byte[] key, bool uring)
     {
         this.index = index;
@@ -34,10 +41,16 @@ internal sealed class Worker : IDisposable
         Span<PollEvent> events = stackalloc PollEvent[512];
         while (!stop.IsCancellationRequested)
         {
+            if (acceptRetryAt != 0 && Environment.TickCount64 >= acceptRetryAt)
+            {
+                acceptRetryAt = 0;
+                foreach (int listener in listeners) poller.Watch(listener, Linux.Read);
+            }
             database.Tick();
             for (int i = 0, count = Math.Min(buffered.Count, 256); i < count; i++)
             {
                 var client = buffered.Dequeue();
+                client.Queued = false;
                 if (!client.Closed && !client.Busy) client.Dispatch();
             }
             int ready = poller.Wait(events, buffered.Count > 0 ? 0 : 50);
@@ -78,7 +91,21 @@ internal sealed class Worker : IDisposable
             {
                 int errno = Marshal.GetLastPInvokeError();
                 if (errno == 4) continue;
-                if (errno is not (11 or 103)) Console.Error.WriteLine($"accept worker={index} errno={errno}");
+                long now = Environment.TickCount64;
+                if (errno is 23 or 24) // ENFILE / EMFILE: suppress readiness until a bounded retry.
+                {
+                    acceptRetryAt = now + AcceptBackoffMilliseconds;
+                    listenerBackoffs++;
+                    // Both listeners share this worker's descriptor budget. Removing
+                    // them also invalidates any remaining listener events in this batch.
+                    foreach (int fdToPause in listeners) poller.Remove(fdToPause);
+                }
+                if (errno is not (11 or 103) && now >= nextAcceptErrorLogAt)
+                {
+                    nextAcceptErrorLogAt = now + 5000;
+                    acceptErrorLogs++;
+                    Console.Error.WriteLine($"accept worker={index} errno={errno}");
+                }
                 break;
             }
             try
@@ -86,11 +113,19 @@ internal sealed class Worker : IDisposable
                 Linux.NoDelay(fd);
                 var client = new Client(this, fd);
                 clients.Add(fd, client);
+                acceptedClients++;
                 Touch(client);
                 Watch(client, Linux.Read);
             }
             catch { Linux.close(fd); throw; }
         }
+    }
+    private void Schedule(Client client)
+    {
+        if (client.Closed || client.Queued) return;
+        client.Queued = true;
+        buffered.Enqueue(client);
+        maxContinuations = Math.Max(maxContinuations, buffered.Count);
     }
     // FIN is reported as readable EOF. Do not watch RDHUP while database work
     // is pending: level-triggered half-close notifications would spin the loop.
@@ -157,8 +192,9 @@ internal sealed class Worker : IDisposable
         }
         else { client.Error(404, "not found"); return; }
         if (!database.Submit(new(operation, id, userId, body, username, client.Respond)))
-            client.Error(503, "server busy");
+            client.Respond(AdmissionFailure(operation));
     }
+    internal static DbResponse AdmissionFailure(DbOperation operation) => operation == DbOperation.Health ? HealthBusy : BusyResponse;
     private static bool IsLike(string path) => path.StartsWith("/posts/", StringComparison.Ordinal)
         && path.EndsWith("/like", StringComparison.Ordinal) && path.Length > 12 && !path.AsSpan(7, path.Length - 12).Contains('/');
     private static bool TryId(ReadOnlySpan<char> text, out long id) => long.TryParse(text, NumberStyles.None,
@@ -169,13 +205,13 @@ internal sealed class Worker : IDisposable
         foreach (var fd in listeners) { poller.Remove(fd); Linux.close(fd); }
         database.Dispose();
         poller.Dispose();
-        Console.WriteLine($"worker={index} responses={completed}");
+        Console.WriteLine($"worker={index} responses={completed} accepted_clients={acceptedClients} max_continuations={maxContinuations} listener_backoffs={listenerBackoffs} accept_error_logs={acceptErrorLogs}");
     }
 
     private sealed unsafe class Client(Worker worker, int fd)
     {
         public int Fd { get; } = fd;
-        public bool Closed, Busy, PeerEnded;
+        public bool Closed, Busy, PeerEnded, Queued;
         public long Expires;
         public int Bucket = -1;
         public Client? Next, Previous;
@@ -213,7 +249,7 @@ internal sealed class Worker : IDisposable
                     PeerEnded = true;
                     worker.Watch(this, 0);
                     if (InputCount == 0) Close();
-                    else worker.buffered.Enqueue(this);
+                    else worker.Schedule(this);
                     return;
                 }
                 int errno = Marshal.GetLastPInvokeError();
@@ -224,7 +260,7 @@ internal sealed class Worker : IDisposable
             }
             // Bound work even when every request completes synchronously.
             if (InputCount == 0) ReleaseInput();
-            else worker.buffered.Enqueue(this);
+            else worker.Schedule(this);
         }
         public void Dispatch()
         {
@@ -299,7 +335,7 @@ internal sealed class Worker : IDisposable
             if (closeAfter || (PeerEnded && InputCount == 0)) { Close(); return; }
             worker.Touch(this);
             worker.Watch(this, PeerEnded ? 0 : Linux.Read);
-            if (InputCount > 0) worker.buffered.Enqueue(this);
+            if (InputCount > 0) worker.Schedule(this);
         }
         private void ReleaseInput()
         {

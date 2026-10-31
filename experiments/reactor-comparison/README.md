@@ -65,9 +65,10 @@ python3 -u experiments/reactor-comparison/run.py --mode full --allow-disposable-
 - SDK 10.0.403/runtime 10.0.14 and Go 1.27.1 are pinned. The setup downloads
   their verified archives. PostgreSQL uses the `postgres:18.6` service image,
   pinned to digest `sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4`;
-  the actual image ID, server settings/version, and host libpq 18 package
-  version are recorded. The host libpq package patch is not frozen across
-  separate workflow runs. Each raw comparison belongs within one runner.
+  the actual image ID, server settings/version, and host libpq package version
+  are recorded. The installer pins both `libpq5` and `libpq-dev` to
+  `18.6-1.pgdg24.04+2`, validated on all three Ubuntu replicas. Each raw
+  comparison belongs within one runner.
 - Exactly one app and one generator run at a time. On a four-CPU runner,
   external `taskset` gives the app two logical CPUs and the generator one;
   Docker limits PostgreSQL to the fourth. This exercises per-core sharding.
@@ -92,9 +93,19 @@ python3 -u experiments/reactor-comparison/run.py --mode full --allow-disposable-
   connection-close, and 76-second idle reuse. Reactor variants additionally
   run their database-pipeline regression, including failed writes followed by
   successful commands and concurrent mixed outcomes with readback.
-  The unchanged original example is a control: extra-test failures are
-  preserved and displayed without patching its code. Its official tests
-  must pass. All extra tests are mandatory for our implementations.
+  Separate child-process regressions check 4,096 pipelined synchronous responses
+  with one queued continuation, then descriptor-exhaustion backoff, service to
+  existing connections, and recovery of new accepts. Only the test child has a
+  reduced descriptor limit; benchmark process limits stay identical.
+  Official assertions are mandatory for every variant. The pre-existing
+  extended HTTP suite is mandatory for frozen Kestrel AOT/JIT and the reactors;
+  the unchanged original example's extended failures remain observational.
+  Every new transport case runs independently on each port, even after another
+  case fails, and writes its outcome to `transport-cases.json`. New transport
+  differences in frozen baselines are observational; every transport and
+  pipeline assertion remains mandatory for reactors. No assertion is disabled
+  or converted into a pass. Correctness logs, JSON, and the final report identify
+  blocking failures separately from observational failures.
 - The mixed workload uses `-gzip -think-scale 2.5` and four loopback IPs with
   two listening ports. At 100,000 users, each destination IP/port receives
   12,500 sockets, below the typical ephemeral-port range. Ramp speed never
@@ -116,6 +127,15 @@ source hashes, resolved package locks/assets, schedules, raw mload histograms,
 endpoint counts/errors, connection and request latency, and one-second telemetry.
 Every raw result and compact summary is also printed in the job log. The final
 table reports all repetitions, including failed or resource-limited ones.
+
+The [initial full comparison](https://github.com/wylieagab/million-users-challenge/actions/runs/41221323833)
+observed the original example's extended suite stop at wildcard gzip precedence
+(`*;q=1, gzip;q=0`). Assertions after that failure did not run; the UTF-16 length
+issue found by source inspection is not an observed failure from that run.
+The original example and frozen Kestrel AOT passed the initial transport group,
+then closed before draining the write-half-closed pipeline. That earlier suite
+stopped at the failure, so it supplied no outcome for later cases. The independent
+case runner now records those later cases instead of inferring their results.
 
 Each artifact name, trial ID, and result identifies its replica. A unique host
 block ID prevents accidental pairing across runners, even if replica numbers

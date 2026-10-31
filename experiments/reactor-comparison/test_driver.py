@@ -1,6 +1,8 @@
 """Measurement invariants; these tests never start PostgreSQL or generate load."""
 import importlib.util
+from contextlib import redirect_stdout
 import io
+import json
 from pathlib import Path
 import subprocess
 import tarfile
@@ -11,9 +13,59 @@ from unittest import mock
 spec = importlib.util.spec_from_file_location('comparison', Path(__file__).with_name('run.py'))
 comparison = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(comparison)
+transport_spec = importlib.util.spec_from_file_location('transport_check', Path(__file__).with_name('transport-check.py'))
+transport = importlib.util.module_from_spec(transport_spec)
+transport_spec.loader.exec_module(transport)
 
 
 class DriverTests(unittest.TestCase):
+    def test_official_failure_blocks_every_variant(self):
+        for name in ('minimal-api', 'kestrel-aot', 'kestrel-jit', 'reactor-epoll', 'reactor-uring'):
+            result = {'official_exit': 1, 'extended_exit': 0, 'transport_exit': 0, 'pipeline_exit': 0}
+            self.assertIn('official', comparison.correctness_verdict(name, result)['blocking_failures'])
+
+    def test_frozen_kestrel_extended_failure_remains_mandatory(self):
+        for name in ('kestrel-aot', 'kestrel-jit'):
+            result = {'official_exit': 0, 'extended_exit': 1, 'transport_exit': 0}
+            self.assertEqual(comparison.correctness_verdict(name, result)['blocking_failures'], ['extended'])
+
+    def test_reactor_transport_failure_blocks_both_backends(self):
+        for name in ('reactor-epoll', 'reactor-uring'):
+            result = {'official_exit': 0, 'extended_exit': 0, 'transport_exit': 1, 'pipeline_exit': 0}
+            self.assertEqual(comparison.correctness_verdict(name, result)['blocking_failures'], ['transport'])
+
+    def test_frozen_half_close_failure_is_retained_without_blocking(self):
+        result = {'official_exit': 0, 'extended_exit': 0, 'transport_exit': 1,
+                  'transport_cases_summary': {'passed': 12, 'failed': 2, 'total': 14}}
+        original = dict(result)
+        verdict = comparison.correctness_verdict('kestrel-aot', result)
+        self.assertEqual(verdict['blocking_failures'], [])
+        self.assertEqual(verdict['observational_failures'], ['transport'])
+        self.assertEqual(result, original)
+        self.assertEqual(result['transport_exit'], 1)
+
+    def test_additional_reactor_regression_cannot_be_silently_ignored(self):
+        result = {'official_exit': 0, 'extended_exit': 0, 'transport_exit': 0,
+                  'pipeline_exit': 0, 'worker_exit': 1}
+        self.assertEqual(comparison.correctness_verdict('reactor-epoll', result)['blocking_failures'], ['worker'])
+
+    def test_transport_case_failure_does_not_prevent_following_case_or_erase_evidence(self):
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):
+            output = Path(temp) / 'transport-cases.json'
+            suite = transport.Suite(output)
+            ran = []
+            def half_close_failure(port):
+                raise AssertionError('Unexpected EOF before all pipelined responses')
+            suite.run('write_half_close_drains_three_responses', 3000, half_close_failure)
+            suite.run('idle_keepalive_76_seconds', 3001, lambda port: ran.append(port))
+            self.assertEqual(suite.finish(), 1)
+            saved = json.loads(output.read_text())
+            self.assertTrue(saved['complete'])
+            self.assertEqual(saved['summary'], {'passed': 1, 'failed': 1, 'total': 2})
+            self.assertEqual([case['status'] for case in saved['cases']], ['failed', 'passed'])
+            self.assertIn('Unexpected EOF', saved['cases'][0]['error'])
+            self.assertEqual(ran, [3001])
+
     def test_real_git_archives_extract_all_three_frozen_sources(self):
         sources = [(comparison.BASE, 'examples/csharp'),
                    (comparison.AOT, 'submissions/csharp-kestrel-wylieagab'),

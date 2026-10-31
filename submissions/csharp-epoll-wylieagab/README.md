@@ -69,6 +69,13 @@ That harness records native package versions, kernel information, and both
 readiness-probe results in its environment metadata and logs alongside the
 .NET SDK/runtime information.
 
+`tests/worker/WorkerTests.csproj` checks ordered overload responses, including
+the degraded health contract. On Linux, `tests/worker-check.py --binary
+./out/FeedApi --backend epoll` starts isolated child servers on ports 3300/3301
+to check pipelining continuation bounds and recovery from descriptor exhaustion.
+It requires `DATABASE_URL`; `--backend io-uring` repeats the same checks for the
+optional backend. The comparison harness runs both automatically.
+
 ## Current limitations
 
 The prototype binds IPv4. No performance results are asserted until the
