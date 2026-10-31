@@ -11,6 +11,8 @@ permissions:
 
 jobs:
   find:
+    # The fork-only comparison runs the unchanged suite for its selected variants.
+    if: github.repository != 'wylieagab/million-users-challenge' || github.base_ref != 'perf-reactor-base'
     runs-on: ubuntu-24.04
     outputs:
       dirs: ${{ steps.dirs.outputs.dirs }}
