@@ -7,7 +7,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import random
 try:
     import resource
@@ -240,20 +240,37 @@ def paired_ratios(results):
 
 
 def extract(ref, source, destination):
-    archive = subprocess.check_output(['git', 'archive', ref, source], cwd=ROOT)
+    prefix = PurePosixPath(source)
+    if prefix.is_absolute() or not prefix.parts or '..' in prefix.parts or '\\' in source:
+        raise RuntimeError('Invalid source archive prefix')
+    destination = Path(destination).resolve()
+    # Host Git settings must not change the frozen source's line endings.
+    archive = subprocess.check_output(['git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf',
+                                       'archive', ref, source], cwd=ROOT)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         for member in tar.getmembers():
-            relative = Path(member.name).relative_to(source)
-            if not relative.parts:
-                continue
-            if member.issym() or member.islnk() or '..' in relative.parts:
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or '..' in name.parts or '\\' in member.name or member.issym() or member.islnk():
                 raise RuntimeError('Unexpected link/path in source archive')
-            target = destination / relative
+            # git archive emits requested directories and their ancestors, e.g.
+            # examples/ before examples/csharp/. Only directories may be skipped.
+            if name == prefix or name in prefix.parents:
+                if not member.isdir():
+                    raise RuntimeError('Source archive ancestor is not a directory')
+                continue
+            if not name.is_relative_to(prefix):
+                raise RuntimeError('Out-of-scope entry in source archive')
+            relative = name.relative_to(prefix)
+            target = destination.joinpath(*relative.parts)
+            if not target.resolve().is_relative_to(destination):
+                raise RuntimeError('Source archive target escapes destination')
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
             elif member.isfile():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(tar.extractfile(member).read())
+            else:
+                raise RuntimeError('Unsupported entry type in source archive')
 
 
 def source_hashes(folder):

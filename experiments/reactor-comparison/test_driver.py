@@ -1,7 +1,12 @@
 """Measurement invariants; these tests never start PostgreSQL or generate load."""
 import importlib.util
+import io
 from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('comparison', Path(__file__).with_name('run.py'))
 comparison = importlib.util.module_from_spec(spec)
@@ -9,6 +14,41 @@ spec.loader.exec_module(comparison)
 
 
 class DriverTests(unittest.TestCase):
+    def test_real_git_archives_extract_all_three_frozen_sources(self):
+        sources = [(comparison.BASE, 'examples/csharp'),
+                   (comparison.AOT, 'submissions/csharp-kestrel-wylieagab'),
+                   (comparison.JIT, 'submissions/csharp-kestrel-jit-wylieagab')]
+        for ref, source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temp:
+                destination = Path(temp) / 'extracted'
+                comparison.extract(ref, source, destination)
+                expected = subprocess.check_output(['git', 'show', f'{ref}:{source}/Program.cs'], cwd=comparison.ROOT)
+                self.assertEqual((destination / 'Program.cs').read_bytes(), expected)
+                self.assertTrue((destination / 'FeedApi.csproj').is_file())
+
+    def test_archive_rejects_unsafe_and_out_of_scope_entries(self):
+        entries = [('examples', tarfile.REGTYPE),
+                   ('examples/csharp', tarfile.REGTYPE),
+                   ('examples/other/file.cs', tarfile.REGTYPE),
+                   ('examples/other', tarfile.DIRTYPE),
+                   ('/examples/csharp/file.cs', tarfile.REGTYPE),
+                   ('examples/csharp/../outside.cs', tarfile.REGTYPE),
+                   ('examples/csharp/..\\outside.cs', tarfile.REGTYPE),
+                   ('examples/csharp/link', tarfile.SYMTYPE),
+                   ('examples/csharp/link', tarfile.LNKTYPE),
+                   ('examples/csharp/pipe', tarfile.FIFOTYPE)]
+        for name, kind in entries:
+            with self.subTest(name=name, kind=kind), tempfile.TemporaryDirectory() as temp:
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode='w') as tar:
+                    entry = tarfile.TarInfo(name)
+                    entry.type = kind
+                    entry.linkname = 'outside'
+                    tar.addfile(entry)
+                with mock.patch.object(comparison.subprocess, 'check_output', return_value=buffer.getvalue()):
+                    with self.assertRaises(RuntimeError):
+                        comparison.extract(comparison.BASE, 'examples/csharp', Path(temp) / 'extracted')
+
     def test_rotated_order_is_repeatable_and_complete(self):
         names = ['minimal', 'aot', 'jit', 'reactor']
         result = comparison.schedule(names, [30000, 80000], 3, 42)

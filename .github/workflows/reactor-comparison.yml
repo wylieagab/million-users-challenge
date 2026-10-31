@@ -72,6 +72,8 @@ jobs:
           persist-credentials: false
       - name: Check measurement and scheduling invariants
         run: python3 experiments/reactor-comparison/test_driver.py
+      - name: Verify pinned submission installer
+        run: sudo bash submissions/csharp-epoll-wylieagab/install.sh
       - name: Prepare pinned tools, database settings, and unchanged seed
         env:
           PG_CONTAINER: ${{ job.services.postgres.id }}
